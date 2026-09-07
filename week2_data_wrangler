@@ -1,0 +1,131 @@
+Week 2: Data Wrangler — Ops Sensor Log Deep-Dive
+Dataset: ops_sensor_log_dirty.csv — one week (25 Jun – 1 Jul 2026) of simulated sensor telemetry (Pressure, Temperature, Flow Rate) from a fictional processing plant, logged every 2 minutes across 5 zones and 3 shifts.
+
+This notebook covers:
+
+Ingestion & Profiling — Data Health Report
+Cleaning Pipeline — clean_ops_data()
+Time-Series Analysis — hourly resampling + 24h rolling average
+Aggregation — Shift x Zone summary tables
+Visualization — Raw vs. Cleaned trend
+
+1. Ingestion & Profiling
+
+             timestamp          Zone    Shift  Pressure_PSI  Temperature_C  Flow_Rate_LPM
+0  2026-07-01 18:28:00    Zone_South    Night    159.443407      83.599922     693.413088
+1  2026-06-26 10:10:00  Zone_Central      NaN    271.325543      54.108382     933.590883
+2  2026-06-29 22:10:00  Zone_Central  Morning    207.832279      72.549214     863.540549
+3  2026-06-30 07:22:00     Zone_East    Night    203.110883      73.029484    1189.537650
+4  2026-07-01 02:28:00    Zone_North  Morning    239.773496      73.752762     983.672559
+
+<class 'pandas.DataFrame'>
+RangeIndex: 5015 entries, 0 to 5014
+Data columns (total 6 columns):
+ #   Column         Non-Null Count  Dtype  
+---  ------         --------------  -----  
+ 0   timestamp      5015 non-null   str    
+ 1   Zone           4984 non-null   str    
+ 2   Shift          4962 non-null   str    
+ 3   Pressure_PSI   4975 non-null   float64
+ 4   Temperature_C  4975 non-null   float64
+ 5   Flow_Rate_LPM  4966 non-null   float64
+dtypes: float64(3), str(3)
+memory usage: 235.2 KB
+
+ count unique                  top  freq        mean         std         min         25%         50%  \
+timestamp        5015   5000  2026-06-29 09:24:00     2         NaN         NaN         NaN         NaN         NaN   
+Zone             4984     15         Zone_Central   996         NaN         NaN         NaN         NaN         NaN   
+Shift            4962      3            Afternoon  1715         NaN         NaN         NaN         NaN         NaN   
+Pressure_PSI   4975.0    NaN                  NaN   NaN  255.254281  845.810206       -50.0  160.753008  200.294439   
+Temperature_C  4975.0    NaN                  NaN   NaN   68.982323   78.829078     -273.15   55.023155   64.808608   
+Flow_Rate_LPM  4966.0    NaN                  NaN   NaN  999.275681  231.769525  600.007437  797.417014  996.286415   
+
+                       75%          max  
+timestamp              NaN          NaN  
+Zone                   NaN          NaN  
+Shift                  NaN          NaN  
+Pressure_PSI    240.099173      15000.0  
+Temperature_C    74.527006       1500.0  
+Flow_Rate_LPM  1201.361276  1399.755865  
+Profiling checks
+Digging past .info() / .describe() to confirm exactly what's wrong before writing any cleaning code (also stands in for a missingno matrix — missingno isn't available in this offline environment, so missingness is profiled numerically below instead
+
+Missing values per column:
+timestamp         0
+Zone             31
+Shift            53
+Pressure_PSI     40
+Temperature_C    40
+Flow_Rate_LPM    49
+dtype: int64
+
+Full-row duplicate count: 15
+
+Unique raw 'Zone' spellings (15 found):
+[' North Zone', ' South Zone', 'ZONE-NORTH', 'ZONE_SOUTH', 'Zone_Central', 'Zone_East', 'Zone_North', 'Zone_North ', 'Zone_South', 'Zone_South ', 'Zone_West', 'z_north', 'z_south', 'zone north', 'zone south']
+
+Timestamp range: 2026-01-07 09:10:00 -> 2026-07-01 22:38:00
+Row count by calendar date:
+timestamp
+2026-01-07      1
+2026-06-25    722
+2026-06-26    722
+2026-06-27    723
+2026-06-28    722
+2026-06-29    722
+2026-06-30    722
+2026-07-01    681
+Name: count, dtype: int64
+
+Pressure sensor-fault codes (-50 / 15000 PSI): 25
+Pressure exact-zero dropout readings: 13
+Temperature sensor-fault codes (-273.15 / 1500 C): 21
+Temperature exact-zero dropout readings: 16
+📋 Data Health Report
+At least 3 (in fact, 6) concrete quality issues found:
+
+Inconsistent categorical spellings — Zone (15 raw variants of 5 real zones). The same zone is logged as Zone_South, ZONE_SOUTH, z_south, zone south, ' South Zone', 'Zone_South ' (trailing space), etc. Left as-is, a groupby('Zone') would silently create 15 fake "zones" instead of 5.
+
+Missing values across every column (~0.6%–1.1% each). Zone (31), Shift (53), Pressure_PSI (40), Temperature_C (40), Flow_Rate_LPM (49) all have gaps — small enough to not simply drop wholesale, but they need an explicit, justified strategy per column type (see Section 2).
+
+A single out-of-range timestamp. One row is stamped 2026-01-07, roughly six months before every other reading (which all fall between 25 Jun and 1 Jul 2026). This is almost certainly a data-entry error, not a real reading — if left in, it would silently break any resample/rolling-window operation over "the week."
+
+Full-row duplicates. 15 exact duplicate rows would double-count those minutes in every downstream aggregate if not removed.
+
+Sensor "fault code" outliers. Pressure_PSI contains flat -50 (14x) and 15000 (11x) values — physically impossible for a PSI gauge on this line (the real data clusters ~120–280 PSI) — and Temperature_C contains flat -273.15 (absolute zero, 10x) and 1500 (10x) — again nowhere near the real ~45–85°C band. These look like literal fault/error codes baked into the sensor firmware, not real physics.
+
+Exact-zero "dropout" readings. Beyond the extreme fault codes, 13 Pressure and 16 Temperature readings sit at exactly 0.0 — implausible for an active, pressurized/heated line mid-run, and a classic default value an industrial sensor reports when it drops offline rather than failing loudly.
+
+Flow_Rate_LPM is comparatively clean (600–1400 LPM throughout, no fault codes, ~1% missing) and needs no outlier filtering.
+
+                count                        mean                  min                  25%                  50%  \
+timestamp        4999  2026-06-28 11:18:09.697939  2026-06-25 00:00:00  2026-06-26 17:39:00  2026-06-28 11:18:00   
+Pressure_PSI   4999.0                  200.166026           120.029631            161.47725           200.363978   
+Temperature_C  4999.0                   64.936001            45.004746            55.217369              64.9008   
+Flow_Rate_LPM  4999.0                  999.481316           600.007437            798.74266           997.037673   
+
+                               75%                  max         std  
+timestamp      2026-06-30 04:57:00  2026-07-01 22:38:00         NaN  
+Pressure_PSI              239.5592           279.958604   45.923936  
+Temperature_C            74.380542            84.995707   11.359721  
+Flow_Rate_LPM          1200.485343          1399.755865  231.112538  
+Compare against the raw .describe() above: Pressure_PSI mean drops from 255.25 → 200.17 and std collapses from 845.81 → 45.92; Temperature_C mean drops from 68.98 → 64.94 and std from 78.83 → 11.36. The fault codes were single-handedly making the plant look wildly unstable — the real signal is a tight, stable operating band
+Total sensor-fault / dropout readings in raw data: 75
+
+Fault readings by (raw, unstandardized) Zone label:
+Zone
+Zone_North      17
+Zone_South      17
+Zone_West       16
+Zone_Central    13
+Zone_East       11
+ZONE-NORTH       1
+Name: count, dtype: int64
+Zone_North and Zone_South together account for ~45% of all 75 fault/dropout readings (17 + 1 mis-spelled "ZONE-NORTH", and 17 respectively) despite there being 5 zones of roughly equal size — this is the actionable finding carried into the Part B report.
+
+Summary
+
+6 data quality issues found and fixed: inconsistent Zone spellings (15→5), missing values across all columns, one corrupted timestamp, 15 duplicate rows, sensor fault codes, and exact-zero sensor dropouts.
+clean_ops_data() is fully reusable — pass it any future week's raw export.
+Cleaning didn't change the "real" trend (pressure/temperature are genuinely stable) — it changed the reliability of the trend, cutting Pressure std from 845.81 to 45.92 and Temperature std from 78.83 to 11.36.
+Actionable finding: sensor faults/dropouts are not evenly spread — Zone_North and Zone_South combined produce ~45% of all fault events. That's a maintenance lead, not a process problem.
